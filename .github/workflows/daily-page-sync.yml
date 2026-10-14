@@ -23,7 +23,40 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pipname: Daily Obituary Sync
+
+on:
+  schedule:
+    # Every day at 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape-and-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
           python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Scraper (new + removed; upsert, no duplicates)
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > service_account.json
+          python scrape_and_sheet.py --sheet-name "HenryWalserChatbotInfo" --worksheet "Sheet1"
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
