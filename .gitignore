@@ -1,0 +1,5 @@
+service_account.json
+output_obituaries/
+output_pages/
+__pycache__/
+*.log
