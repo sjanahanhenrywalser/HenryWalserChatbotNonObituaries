@@ -2,9 +2,12 @@ name: Daily Page Sync
 
 on:
   schedule:
-    # Runs automatically every day at 03:00 UTC (offset from the obituary sync at 02:00)
+    # Runs automatically every day at 03:00 UTC (offset from the obituary job's 02:00)
     - cron: '0 3 * * *'
-  workflow_dispatch: # Allows manual trigger anytime from GitHub UI
+  workflow_dispatch: # Allows manual trigger anytime from the GitHub Actions UI
+
+permissions:
+  contents: write   # lets github-actions[bot] push the updated tracker file
 
 jobs:
   scrape-and-sync:
@@ -22,15 +25,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
 
       - name: Run Page Scraper
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
           echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > service_account.json
-          # --force re-scrapes every page each run so edited pages stay current
-          # (there are only ~89 pages, so this is cheap). Drop --force to only
-          # fetch pages not seen before.
           python scrape_pages.py --sheet-name "HenryWalserChatbotInfo" --worksheet "OtherPages" --force
 
       - name: Save updated processed_pages.json back to Repo

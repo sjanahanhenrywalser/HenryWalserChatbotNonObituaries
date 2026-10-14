@@ -6,15 +6,14 @@ import os
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
 import gspread
 from gspread.exceptions import APIError
+from playwright.sync_api import sync_playwright
 
-# Configure Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -25,18 +24,17 @@ PROCESSED_TRACKER = "processed_pages.json"
 OUTPUT_DIR = "output_pages"
 BASE_HOST = "www.henrywalser.com"
 
-# Links to these file types / paths are not "pages"; we skip them as page links.
 SKIP_EXT = (".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".pdf", ".css",
             ".js", ".ico", ".zip", ".mp4", ".mp3", ".woff", ".woff2", ".ttf",
             ".xml", ".gz")
-# These sections are obituary content; this script is EVERYTHING ELSE.
 SKIP_PATH_PREFIXES = ("/obituaries", "/Administration")
 VIDEO_HOST_HINTS = ("youtube.com", "youtu.be", "youtube-nocookie.com", "vimeo.com",
                     "player.vimeo.com", "wistia", "tukios", "brightcove")
+CHALLENGE_HINTS = ("just a moment", "attention required", "checking your browser",
+                   "verify you are human")
 
 
 def load_processed_ids():
-    """Safely reads the tracker, handling empty or missing files gracefully."""
     if os.path.exists(PROCESSED_TRACKER) and os.path.getsize(PROCESSED_TRACKER) > 0:
         try:
             with open(PROCESSED_TRACKER, "r", encoding="utf-8") as f:
@@ -44,21 +42,20 @@ def load_processed_ids():
                 if isinstance(content, list):
                     return set(content)
         except json.JSONDecodeError:
-            logging.warning("⚠️ processed_pages.json was corrupted. Starting empty.")
+            logging.warning("processed_pages.json was corrupted. Starting empty.")
             return set()
         except Exception as e:
-            logging.warning(f"⚠️ Could not read {PROCESSED_TRACKER}: {e}. Starting empty.")
+            logging.warning(f"Could not read {PROCESSED_TRACKER}: {e}. Starting empty.")
             return set()
     return set()
 
 
 def save_processed_ids(processed_ids):
-    """Safely writes processed page keys as a JSON array."""
     try:
         with open(PROCESSED_TRACKER, "w", encoding="utf-8") as f:
             json.dump(sorted(processed_ids), f, indent=2)
     except Exception as e:
-        logging.error(f"❌ Failed to save {PROCESSED_TRACKER}: {e}")
+        logging.error(f"Failed to save {PROCESSED_TRACKER}: {e}")
 
 
 def same_host(url):
@@ -67,7 +64,6 @@ def same_host(url):
 
 
 def page_key(url):
-    """Stable identity for a page: its path, no query/fragment, no trailing slash."""
     path = urlparse(url).path or "/"
     if path != "/" and path.endswith("/"):
         path = path.rstrip("/")
@@ -75,7 +71,6 @@ def page_key(url):
 
 
 def section_of(url):
-    """Top-level section, e.g. /our-services/what-is-a-funeral -> our-services."""
     parts = [p for p in urlparse(url).path.split("/") if p]
     return parts[0] if parts else "home"
 
@@ -83,7 +78,6 @@ def section_of(url):
 def is_skippable_path(path):
     if any(path.startswith(p) for p in SKIP_PATH_PREFIXES):
         return True
-    # crawler-trap guard: a path segment repeated more than twice
     segs = [s for s in path.split("/") if s]
     for i in range(len(segs)):
         run = 1
@@ -97,34 +91,15 @@ def is_skippable_path(path):
     return False
 
 
-def clean_text(raw_html_or_text):
-    if not raw_html_or_text:
-        return ""
-    text = html.unescape(html.unescape(raw_html_or_text))
-    soup = BeautifulSoup(text, "html.parser")
-    lines = soup.get_text(separator="\n").splitlines()
-    cleaned = []
-    for line in lines:
-        s = line.strip()
-        if s and not s.startswith("http"):
-            cleaned.append(s)
-    return "\n\n".join(cleaned)
-
-
 def extract_main_text(soup):
-    """Best-effort main-content text from raw HTML. Strips nav/header/footer/etc.
-    NOTE: these pages are JavaScript-rendered, so raw HTML may contain little body
-    text until the site has allowlisted this scraper (or a rendered fetch is used)."""
     source = soup.find("main") or soup.find("article") or soup.body
     if not source:
         return ""
-    # work on a copy so link/video extraction (done earlier) isn't affected
     body = BeautifulSoup(str(source), "html.parser")
     for tag in body.find_all(["script", "style", "noscript", "nav", "header",
                               "footer", "aside", "form", "svg", "iframe"]):
         tag.decompose()
     text = body.get_text(separator="\n")
-    # remove the JS placeholder wherever it appears (inline or standalone)
     text = re.sub(r"Loading\.\.\.", " ", text)
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return "\n\n".join(lines)
@@ -134,23 +109,19 @@ def extract_metadata(soup):
     meta = {}
     title_tag = soup.find("title")
     meta["title"] = html.unescape(title_tag.text.strip()) if title_tag else ""
-    # meta description
     desc = soup.find("meta", attrs={"name": "description"}) or \
         soup.find("meta", attrs={"property": "og:description"})
     meta["description"] = html.unescape(desc["content"].strip()) if desc and desc.get("content") else ""
-    # og:title fallback
     if not meta["title"]:
         ogt = soup.find("meta", attrs={"property": "og:title"})
         if ogt and ogt.get("content"):
             meta["title"] = html.unescape(ogt["content"].strip())
-    # first H1
     h1 = soup.find("h1")
     meta["h1"] = h1.get_text(strip=True) if h1 else ""
     return meta
 
 
 def extract_links(soup, page_url):
-    """Return (internal_page_links, external_links, video_links)."""
     internal, external, videos = set(), set(), set()
 
     def consider(raw):
@@ -175,7 +146,6 @@ def extract_links(soup, page_url):
         else:
             external.add(full)
 
-    # <a href>, <area href>, and common data-* link attrs
     for a in soup.find_all(["a", "area"]):
         consider(a.get("href"))
     for el in soup.find_all(attrs={"data-href": True}):
@@ -183,7 +153,6 @@ def extract_links(soup, page_url):
     for el in soup.find_all(attrs={"data-url": True}):
         consider(el.get("data-url"))
 
-    # iframes / embeds often carry the video
     for frame in soup.find_all(["iframe", "embed", "source"]):
         src = frame.get("src")
         if src:
@@ -191,7 +160,6 @@ def extract_links(soup, page_url):
             if any(h in urlparse(full).netloc.lower() for h in VIDEO_HOST_HINTS):
                 videos.add(full)
 
-    # bare video URLs sometimes sit in scripts/JSON
     for m in re.findall(r"https?://[^\s\"'<>\\]+", str(soup)):
         if any(h in urlparse(m).netloc.lower() for h in VIDEO_HOST_HINTS):
             videos.add(m.split("\\")[0])
@@ -202,10 +170,8 @@ def extract_links(soup, page_url):
 def parse_page(html_content, page_url):
     soup = BeautifulSoup(html_content, "html.parser")
     meta = extract_metadata(soup)
-    # Extract links/videos FIRST, before text extraction decomposes iframes etc.
     internal, external, videos = extract_links(soup, page_url)
     text = extract_main_text(soup)
-
     title = meta["title"] or meta["h1"] or page_key(page_url)
     return {
         "key": page_key(page_url),
@@ -221,13 +187,12 @@ def parse_page(html_content, page_url):
 
 
 def get_urls_from_sitemap(sitemap_url, session):
-    """Walk the sitemap index; return NON-obituary page URLs."""
-    logging.info(f"🔍 Fetching sitemap structure from {sitemap_url}...")
+    logging.info(f"Fetching sitemap structure from {sitemap_url}...")
     try:
         resp = session.get(sitemap_url, impersonate="chrome", timeout=15)
         resp.raise_for_status()
     except Exception as e:
-        logging.error(f"❌ Failed to fetch sitemap {sitemap_url}: {e}")
+        logging.error(f"Failed to fetch sitemap {sitemap_url}: {e}")
         return []
 
     soup = BeautifulSoup(resp.content, "xml")
@@ -237,7 +202,6 @@ def get_urls_from_sitemap(sitemap_url, session):
         logging.info(f"Found {len(sub_sitemaps)} sub-sitemaps.")
         all_urls = []
         for idx, sub_url in enumerate(sub_sitemaps, start=1):
-            # Skip obituary sitemaps entirely — this script is everything else.
             if "obituar" in sub_url.lower():
                 logging.info(f"   [{idx}/{len(sub_sitemaps)}] Skipping obituary sitemap: {sub_url}")
                 continue
@@ -275,7 +239,7 @@ section: "{record['section']}"
 {record.get('description') or '(none)'}
 
 ## Page Text
-{record.get('text') or '(no text found in raw HTML — page may be JavaScript-rendered)'}
+{record.get('text') or '(no text found)'}
 
 {block('Video Links', record['video_links'])}
 {block('Internal Page Links', record['internal_links'])}
@@ -287,27 +251,33 @@ def save_locally(record):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     safe = record["key"].strip("/").replace("/", "_") or "home"
     filepath = os.path.join(OUTPUT_DIR, f"page_{safe}.md")
-    content = build_markdown_document(record)
     with open(filepath, "w", encoding="utf-8") as f:
-        f.write(content)
-    return filepath, content
+        f.write(build_markdown_document(record))
+    return filepath
 
 
-def fetch_and_process(url, session, current_index, total_count, timeout=15):
-    start = time.time()
+def render_html(page, url, settle_ms, nav_timeout_ms):
+    resp = page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+    status = resp.status if resp else None
     try:
-        resp = session.get(url, impersonate="chrome", timeout=timeout)
-        resp.raise_for_status()
-        record = parse_page(resp.text, url)
-        elapsed = round(time.time() - start, 2)
-        save_locally(record)
-        logging.info(f"✅ [{current_index}/{total_count}] ({elapsed}s) {record['title']} "
-                     f"[{len(record['video_links'])} video, {len(record['internal_links'])} links]")
-        return record["key"], record
-    except Exception as exc:
-        elapsed = round(time.time() - start, 2)
-        logging.error(f"❌ [{current_index}/{total_count}] ({elapsed}s) {url}: {exc}")
-        return None, None
+        page.wait_for_load_state("networkidle", timeout=12000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_function(
+            "() => { const el = document.querySelector('main, article') || document.body;"
+            " return el && el.innerText && el.innerText.replace(/Loading\\.\\.\\./g,'').trim().length > 150; }",
+            timeout=settle_ms,
+        )
+    except Exception:
+        pass
+    page.wait_for_timeout(400)
+    return page.content(), status
+
+
+def is_challenge(title):
+    t = (title or "").strip().lower()
+    return any(t.startswith(c) for c in CHALLENGE_HINTS)
 
 
 def safe_append_batch_with_retry(sheet, batch, max_retries=5):
@@ -319,35 +289,35 @@ def safe_append_batch_with_retry(sheet, batch, max_retries=5):
         except APIError as e:
             if "429" in str(e) or "Quota exceeded" in str(e):
                 backoff = attempt * 10
-                logging.warning(f"⚠️ Sheets 429. Backing off {backoff}s ({attempt}/{max_retries})...")
+                logging.warning(f"Sheets 429. Backing off {backoff}s ({attempt}/{max_retries})...")
                 time.sleep(backoff)
             else:
-                logging.error(f"❌ Sheets API Error: {e}")
+                logging.error(f"Sheets API Error: {e}")
                 time.sleep(5)
         except Exception as err:
-            logging.error(f"❌ Unexpected upload error: {err}")
+            logging.error(f"Unexpected upload error: {err}")
             time.sleep(5)
-    logging.critical("❌ Failed to upload batch after max retries.")
+    logging.critical("Failed to upload batch after max retries.")
     return False
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scrape non-obituary pages of henrywalser.com (text + links + video links) to Google Sheets."
+        description="Render non-obituary pages of henrywalser.com and sync text + links to Google Sheets."
     )
     parser.add_argument("--sitemap", default="https://www.henrywalser.com/sitemap.xml")
-    parser.add_argument("--sheet-name", required=True,
-                        help="Exact title of your Google Sheet document")
-    parser.add_argument("--worksheet", default="Pages",
-                        help="Worksheet/tab name to write pages into (default: Pages)")
+    parser.add_argument("--sheet-name", required=True)
+    parser.add_argument("--worksheet", default="OtherPages")
     parser.add_argument("--credentials", default="service_account.json")
-    parser.add_argument("--workers", type=int, default=5)
     parser.add_argument("--max", type=int, default=None)
     parser.add_argument("--force", action="store_true",
-                        help="Re-scrape all pages even if already processed (content changes).")
+                        help="Re-scrape all pages even if already processed.")
+    parser.add_argument("--settle-ms", type=int, default=8000,
+                        help="Max ms to wait for JS content to appear per page.")
+    parser.add_argument("--nav-timeout-ms", type=int, default=45000)
     args = parser.parse_args()
 
-    logging.info("🔑 Connecting to Google Sheets API...")
+    logging.info("Connecting to Google Sheets API...")
     gc = gspread.service_account(filename=args.credentials)
     spreadsheet = gc.open(args.sheet_name)
     try:
@@ -360,7 +330,6 @@ def main():
     headers = ["url", "title", "section", "description", "text",
                "video_links", "internal_links", "external_links"]
     if not sheet.row_values(1):
-        logging.info("Setting up header row...")
         sheet.append_row(headers)
 
     processed = load_processed_ids()
@@ -368,51 +337,75 @@ def main():
 
     session = cffi_requests.Session()
     all_urls = get_urls_from_sitemap(args.sitemap, session)
-    logging.info(f"📊 {len(all_urls)} non-obituary page URL(s) in sitemap.")
+    logging.info(f"{len(all_urls)} non-obituary page URL(s) in sitemap.")
 
-    if args.force:
-        new_urls = all_urls
-    else:
-        new_urls = [u for u in all_urls if page_key(u) not in processed]
+    new_urls = all_urls if args.force else [u for u in all_urls if page_key(u) not in processed]
     total = len(new_urls)
-    logging.info(f"📊 {total} page(s) to process"
-                 f"{' (forced full re-scrape)' if args.force else ' (new only)'}.")
-
+    logging.info(f"{total} page(s) to process{' (forced)' if args.force else ' (new only)'}.")
     if not new_urls:
-        logging.info("🎉 Pages are up to date. Nothing to do.")
+        logging.info("Pages are up to date. Nothing to do.")
         return
-
     if args.max:
         new_urls = new_urls[: args.max]
         total = len(new_urls)
         logging.info(f"Limit applied: first {total} page(s).")
 
     rows, newly_done = [], set()
-    logging.info(f"🚀 Scraping with {args.workers} workers...")
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = {ex.submit(fetch_and_process, u, session, i, total): u
-                   for i, u in enumerate(new_urls, start=1)}
-        done = 0
-        for fut in as_completed(futures):
-            done += 1
-            key, record = fut.result()
-            if key and record:
+    challenges = 0
+
+    custom_header = os.environ.get("CRAWLER_KEY")
+    extra_headers = {"X-Crawler-Key": custom_header} if custom_header else {}
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+    logging.info("Launching headless Chromium...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+        ctx = browser.new_context(user_agent=ua, viewport={"width": 1366, "height": 900},
+                                  extra_http_headers=extra_headers)
+        ctx.route("**/*", lambda r: r.abort()
+                  if r.request.resource_type in ("image", "media", "font") else r.continue_())
+        page = ctx.new_page()
+
+        for idx, url in enumerate(new_urls, start=1):
+            start = time.time()
+            try:
+                html_content, status = render_html(page, url, args.settle_ms, args.nav_timeout_ms)
+                title_now = page.title()
+                if is_challenge(title_now):
+                    challenges += 1
+                    logging.error(f"[{idx}/{total}] Cloudflare challenge on {url} "
+                                  f"(title: {title_now!r}). Needs allowlisting.")
+                    continue
+                record = parse_page(html_content, url)
+                save_locally(record)
+                elapsed = round(time.time() - start, 2)
+                logging.info(f"[{idx}/{total}] ({elapsed}s) {record['title']} "
+                             f"[text {len(record['text'])} chars, "
+                             f"{len(record['video_links'])} video, "
+                             f"{len(record['internal_links'])} links]")
                 rows.append([
-                    record["url"],
-                    record["title"],
-                    record["section"],
-                    record.get("description", ""),
-                    record.get("text", ""),
+                    record["url"], record["title"], record["section"],
+                    record.get("description", ""), record.get("text", ""),
                     "\n".join(record["video_links"]),
                     "\n".join(record["internal_links"]),
                     "\n".join(record["external_links"]),
                 ])
-                newly_done.add(key)
-            if done % 25 == 0 or done == total:
-                logging.info(f"📈 Progress: {done}/{total}")
+                newly_done.add(record["key"])
+            except Exception as exc:
+                elapsed = round(time.time() - start, 2)
+                logging.error(f"[{idx}/{total}] ({elapsed}s) {url}: {exc}")
+            if idx % 25 == 0 or idx == total:
+                logging.info(f"Progress: {idx}/{total}")
+
+        browser.close()
+
+    if challenges:
+        logging.warning(f"{challenges} page(s) hit a Cloudflare challenge. If this is most "
+                        f"pages, the crawler needs allowlisting (IP + User-Agent + X-Crawler-Key).")
 
     if rows:
-        logging.info(f"☁️ Uploading {len(rows)} page row(s) to Google Sheets...")
+        logging.info(f"Uploading {len(rows)} page row(s)...")
         for i in range(0, len(rows), 500):
             batch = rows[i:i + 500]
             if safe_append_batch_with_retry(sheet, batch):
@@ -421,7 +414,9 @@ def main():
                 logging.error(f"   Failed batch at index {i}.")
         processed.update(newly_done)
         save_processed_ids(processed)
-        logging.info(f"🎉 Synced {len(rows)} page(s) to '{args.sheet_name}' / '{args.worksheet}'.")
+        logging.info(f"Synced {len(rows)} page(s) to '{args.sheet_name}' / '{args.worksheet}'.")
+    else:
+        logging.warning("No rows produced. If challenges were logged, allowlisting is needed.")
 
 
 if __name__ == "__main__":

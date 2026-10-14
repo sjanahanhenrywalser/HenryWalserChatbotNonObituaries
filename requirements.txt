@@ -2,3 +2,4 @@ beautifulsoup4
 curl_cffi
 gspread
 lxml
+playwright
