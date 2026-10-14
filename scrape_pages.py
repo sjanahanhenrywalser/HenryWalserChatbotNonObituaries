@@ -28,7 +28,8 @@ BASE_HOST = "www.henrywalser.com"
 SKIP_EXT = (".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".pdf", ".css",
             ".js", ".ico", ".zip", ".mp4", ".mp3", ".woff", ".woff2", ".ttf",
             ".xml", ".gz")
-SKIP_PATH_PREFIXES = ("/obituaries", "/Administration")
+SKIP_PATH_PREFIXES = ("/obituaries", "/Administration", "/administration",
+                      "/admin", "/login", "/signin", "/sign-in")
 VIDEO_HOST_HINTS = ("youtube.com", "youtu.be", "youtube-nocookie.com", "vimeo.com",
                     "player.vimeo.com", "wistia", "tukios", "brightcove")
 CHALLENGE_HINTS = ("just a moment", "attention required", "checking your browser",
@@ -375,10 +376,9 @@ def main():
                     logging.error(f"[{visited}] Cloudflare challenge on {url}. Needs allowlisting.")
                     continue
                 record = parse_page(html_content, url)
-                save_locally(record)
                 elapsed = round(time.time() - start, 2)
 
-                # Discover new internal pages and add them to the frontier
+                # Still follow this page's links for discovery...
                 discovered = 0
                 for link in record["internal_links"]:
                     k = page_key(link)
@@ -386,6 +386,17 @@ def main():
                         seen.add(k)
                         frontier.append(link)
                         discovered += 1
+
+                # ...but DON'T store admin/login or empty pages.
+                title_l = (record["title"] or "").lower()
+                is_admin = ("log in" in title_l or "login" in title_l
+                            or "administrator" in title_l or record["section"] == "admin")
+                is_blank = not (record["title"] or "").strip() and not record["text"].strip()
+                if is_admin or is_blank:
+                    logging.info(f"[{visited}] skipped junk page ({'admin' if is_admin else 'blank'}): {url}")
+                    continue
+
+                save_locally(record)
 
                 logging.info(f"[{visited}] ({elapsed}s) {record['title']} "
                              f"[text {len(record['text'])} chars, "
