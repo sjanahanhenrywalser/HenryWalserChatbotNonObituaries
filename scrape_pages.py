@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -303,17 +304,18 @@ def safe_append_batch_with_retry(sheet, batch, max_retries=5):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Render non-obituary pages of henrywalser.com and sync text + links to Google Sheets."
+        description="Crawl non-obituary pages of henrywalser.com (render JS, follow internal links) to Google Sheets."
     )
     parser.add_argument("--sitemap", default="https://www.henrywalser.com/sitemap.xml")
+    parser.add_argument("--base-url", default="https://www.henrywalser.com/")
     parser.add_argument("--sheet-name", required=True)
     parser.add_argument("--worksheet", default="OtherPages")
     parser.add_argument("--credentials", default="service_account.json")
-    parser.add_argument("--max", type=int, default=None)
+    parser.add_argument("--max-pages", type=int, default=1000,
+                        help="Safety cap on total pages crawled.")
     parser.add_argument("--force", action="store_true",
-                        help="Re-scrape all pages even if already processed.")
-    parser.add_argument("--settle-ms", type=int, default=8000,
-                        help="Max ms to wait for JS content to appear per page.")
+                        help="Full refresh: clear the tab and re-write every reachable page.")
+    parser.add_argument("--settle-ms", type=int, default=8000)
     parser.add_argument("--nav-timeout-ms", type=int, default=45000)
     args = parser.parse_args()
 
@@ -329,34 +331,28 @@ def main():
 
     headers = ["url", "title", "section", "description", "text",
                "video_links", "internal_links", "external_links"]
-    if not sheet.row_values(1):
-        sheet.append_row(headers)
 
     processed = load_processed_ids()
     logging.info(f"Loaded {len(processed)} previously processed page(s).")
 
+    # --- Seed the crawl from the sitemap + the homepage ---
     session = cffi_requests.Session()
-    all_urls = get_urls_from_sitemap(args.sitemap, session)
-    logging.info(f"{len(all_urls)} non-obituary page URL(s) in sitemap.")
-
-    new_urls = all_urls if args.force else [u for u in all_urls if page_key(u) not in processed]
-    total = len(new_urls)
-    logging.info(f"{total} page(s) to process{' (forced)' if args.force else ' (new only)'}.")
-    if not new_urls:
-        logging.info("Pages are up to date. Nothing to do.")
-        return
-    if args.max:
-        new_urls = new_urls[: args.max]
-        total = len(new_urls)
-        logging.info(f"Limit applied: first {total} page(s).")
+    seed_urls = get_urls_from_sitemap(args.sitemap, session)
+    seed_urls.append(args.base_url)
+    seen, frontier = set(), deque()
+    for u in seed_urls:
+        k = page_key(u)
+        if k not in seen:
+            seen.add(k)
+            frontier.append(u)
+    logging.info(f"Seeded crawl with {len(frontier)} URL(s) from sitemap + homepage.")
 
     rows, newly_done = [], set()
     challenges = 0
-
-    custom_header = os.environ.get("CRAWLER_KEY")
-    extra_headers = {"X-Crawler-Key": custom_header} if custom_header else {}
     ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    custom_header = os.environ.get("CRAWLER_KEY")
+    extra_headers = {"X-Crawler-Key": custom_header} if custom_header else {}
 
     logging.info("Launching headless Chromium...")
     with sync_playwright() as p:
@@ -367,23 +363,35 @@ def main():
                   if r.request.resource_type in ("image", "media", "font") else r.continue_())
         page = ctx.new_page()
 
-        for idx, url in enumerate(new_urls, start=1):
+        visited = 0
+        while frontier and visited < args.max_pages:
+            url = frontier.popleft()
+            visited += 1
             start = time.time()
             try:
                 html_content, status = render_html(page, url, args.settle_ms, args.nav_timeout_ms)
-                title_now = page.title()
-                if is_challenge(title_now):
+                if is_challenge(page.title()):
                     challenges += 1
-                    logging.error(f"[{idx}/{total}] Cloudflare challenge on {url} "
-                                  f"(title: {title_now!r}). Needs allowlisting.")
+                    logging.error(f"[{visited}] Cloudflare challenge on {url}. Needs allowlisting.")
                     continue
                 record = parse_page(html_content, url)
                 save_locally(record)
                 elapsed = round(time.time() - start, 2)
-                logging.info(f"[{idx}/{total}] ({elapsed}s) {record['title']} "
+
+                # Discover new internal pages and add them to the frontier
+                discovered = 0
+                for link in record["internal_links"]:
+                    k = page_key(link)
+                    if k not in seen:
+                        seen.add(k)
+                        frontier.append(link)
+                        discovered += 1
+
+                logging.info(f"[{visited}] ({elapsed}s) {record['title']} "
                              f"[text {len(record['text'])} chars, "
-                             f"{len(record['video_links'])} video, "
-                             f"{len(record['internal_links'])} links]")
+                             f"{len(record['video_links'])} video, +{discovered} new links, "
+                             f"queue {len(frontier)}]")
+
                 rows.append([
                     record["url"], record["title"], record["section"],
                     record.get("description", ""), record.get("text", ""),
@@ -394,29 +402,52 @@ def main():
                 newly_done.add(record["key"])
             except Exception as exc:
                 elapsed = round(time.time() - start, 2)
-                logging.error(f"[{idx}/{total}] ({elapsed}s) {url}: {exc}")
-            if idx % 25 == 0 or idx == total:
-                logging.info(f"Progress: {idx}/{total}")
+                logging.error(f"[{visited}] ({elapsed}s) {url}: {exc}")
 
         browser.close()
 
+    if visited >= args.max_pages and frontier:
+        logging.warning(f"Hit --max-pages ({args.max_pages}); {len(frontier)} still queued. "
+                        f"Raise --max-pages if the site is larger.")
     if challenges:
-        logging.warning(f"{challenges} page(s) hit a Cloudflare challenge. If this is most "
-                        f"pages, the crawler needs allowlisting (IP + User-Agent + X-Crawler-Key).")
+        logging.warning(f"{challenges} page(s) hit a Cloudflare challenge. If most pages, "
+                        f"the crawler needs allowlisting (IP + User-Agent + X-Crawler-Key).")
 
-    if rows:
-        logging.info(f"Uploading {len(rows)} page row(s)...")
-        for i in range(0, len(rows), 500):
-            batch = rows[i:i + 500]
+    logging.info(f"Crawl finished: {len(rows)} page(s) captured.")
+
+    if not rows:
+        logging.warning("No rows produced. If challenges were logged, allowlisting is needed.")
+        return
+
+    if args.force:
+        # Full refresh: wipe the tab and write everything fresh (no duplicates).
+        logging.info("Full refresh: clearing the worksheet and rewriting all rows...")
+        sheet.clear()
+        sheet.append_row(headers)
+        to_upload = rows
+        processed = set(newly_done)
+    else:
+        # Incremental: only add pages not already processed.
+        if not sheet.row_values(1):
+            sheet.append_row(headers)
+        to_upload = [r for r, k in zip(rows, [page_key(x[0]) for x in rows])
+                     if k not in processed]
+        processed.update(newly_done)
+
+    if to_upload:
+        logging.info(f"Uploading {len(to_upload)} row(s)...")
+        for i in range(0, len(to_upload), 500):
+            batch = to_upload[i:i + 500]
             if safe_append_batch_with_retry(sheet, batch):
-                logging.info(f"   Uploaded [{min(i + 500, len(rows))}/{len(rows)}].")
+                logging.info(f"   Uploaded [{min(i + 500, len(to_upload))}/{len(to_upload)}].")
             else:
                 logging.error(f"   Failed batch at index {i}.")
-        processed.update(newly_done)
-        save_processed_ids(processed)
-        logging.info(f"Synced {len(rows)} page(s) to '{args.sheet_name}' / '{args.worksheet}'.")
     else:
-        logging.warning("No rows produced. If challenges were logged, allowlisting is needed.")
+        logging.info("No new pages to upload.")
+
+    save_processed_ids(processed)
+    logging.info(f"Synced to '{args.sheet_name}' / '{args.worksheet}'. "
+                 f"Total reachable pages: {len(rows)}.")
 
 
 if __name__ == "__main__":
