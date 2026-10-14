@@ -31,7 +31,7 @@ jobs:
           # --force re-scrapes every page each run so edited pages stay current
           # (there are only ~89 pages, so this is cheap). Drop --force to only
           # fetch pages not seen before.
-          python scrape_pages.py --sheet-name "HenryWalserChatbotInfo" --worksheet "Pages" --force
+          python scrape_pages.py --sheet-name "HenryWalserChatbotInfo" --worksheet "OtherPages" --force
 
       - name: Save updated processed_pages.json back to Repo
         run: |
