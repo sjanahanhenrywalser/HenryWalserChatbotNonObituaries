@@ -40,3 +40,11 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add processed_pages.json
           git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update processed_pages.json [skip ci]" && git push)
+      - name: Record last run time on the spreadsheet
+        if: always()                 # also records failures, when you most want to know
+        continue-on-error: true      # a timestamp problem never fails the sync itself
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > service_account.json
+          python write_status.py --sheet-name "HenryWalserChatbotInfo" --job "Website pages" --data-tab "OtherPages" --result "${{ job.status }}"
