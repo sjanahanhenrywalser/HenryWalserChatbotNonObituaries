@@ -37,6 +37,48 @@ SKIP_PATH_PREFIXES = ("/Administration", "/administration",
 OBITUARY_PAGE_SEEDS = ("/obituaries/obituary-listings",)
 VIDEO_HOST_HINTS = ("youtube.com", "youtu.be", "youtube-nocookie.com", "vimeo.com",
                     "player.vimeo.com", "wistia", "tukios", "brightcove")
+# ------------------------------------------------ crawler identity
+# For Tribute Technology's allowlist. Both values come from GitHub, never from
+# this file: the CRAWLER_KEY secret and the optional CRAWLER_UA variable.
+# They are only ever sent to henrywalser.com, never to other sites.
+SITE_HOST = "henrywalser.com"
+DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+CRAWLER_KEY = os.environ.get("CRAWLER_KEY", "").strip()
+CRAWLER_UA = os.environ.get("CRAWLER_UA", "").strip()
+
+
+def is_site_url(url):
+    host = (urlparse(url).hostname or "").lower()
+    return host == SITE_HOST or host.endswith("." + SITE_HOST)
+
+
+def site_headers(url):
+    """The crawler's identifying headers, for henrywalser.com addresses only."""
+    if not is_site_url(url):
+        return {}
+    h = {}
+    if CRAWLER_UA:
+        h["User-Agent"] = CRAWLER_UA
+    if CRAWLER_KEY:
+        h["X-Crawler-Key"] = CRAWLER_KEY
+    return h
+
+
+def route_request(route):
+    """Every request the browser makes: skip images, media and fonts; add the
+    crawler key only to requests going to henrywalser.com (never to YouTube,
+    accessibility widgets or any other site embedded in a page)."""
+    req = route.request
+    if req.resource_type in ("image", "media", "font"):
+        return route.abort()
+    if CRAWLER_KEY and is_site_url(req.url):
+        headers = dict(req.headers)
+        headers["x-crawler-key"] = CRAWLER_KEY
+        return route.continue_(headers=headers)
+    return route.continue_()
+
+
 CHALLENGE_HINTS = ("just a moment", "attention required", "checking your browser",
                    "verify you are human")
 
@@ -232,7 +274,7 @@ def parse_page(html_content, page_url):
 def get_urls_from_sitemap(sitemap_url, session):
     logging.info(f"Fetching sitemap structure from {sitemap_url}...")
     try:
-        resp = session.get(sitemap_url, impersonate="chrome", timeout=15)
+        resp = session.get(sitemap_url, impersonate="chrome", timeout=15, headers=site_headers(sitemap_url))
         resp.raise_for_status()
     except Exception as e:
         logging.error(f"Failed to fetch sitemap {sitemap_url}: {e}")
@@ -396,18 +438,14 @@ def main():
 
     rows, newly_done = [], set()
     challenges = 0
-    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-    custom_header = os.environ.get("CRAWLER_KEY")
-    extra_headers = {"X-Crawler-Key": custom_header} if custom_header else {}
+    ua = CRAWLER_UA or DEFAULT_UA
+    logging.info(f"Crawler User-Agent: {ua} | crawler key: {'set' if CRAWLER_KEY else 'not set'}")
 
     logging.info("Launching headless Chromium...")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
-        ctx = browser.new_context(user_agent=ua, viewport={"width": 1366, "height": 900},
-                                  extra_http_headers=extra_headers)
-        ctx.route("**/*", lambda r: r.abort()
-                  if r.request.resource_type in ("image", "media", "font") else r.continue_())
+        ctx = browser.new_context(user_agent=ua, viewport={"width": 1366, "height": 900})
+        ctx.route("**/*", route_request)          # the key goes to henrywalser.com only
         page = ctx.new_page()
 
         visited = 0

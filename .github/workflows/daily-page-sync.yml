@@ -30,6 +30,8 @@ jobs:
       - name: Run Page Scraper
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          CRAWLER_KEY: ${{ secrets.CRAWLER_KEY }}   # secret header for Tribute Technology's allowlist
+          CRAWLER_UA: ${{ vars.CRAWLER_UA }}        # optional; empty = normal browser User-Agent
         run: |
           echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > service_account.json
           python scrape_pages.py --sheet-name "HenryWalserChatbotInfo" --worksheet "OtherPages" --force
