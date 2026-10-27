@@ -3,6 +3,7 @@ import html
 import json
 import logging
 import os
+import gzip
 import re
 import sys
 import time
@@ -28,8 +29,12 @@ BASE_HOST = "www.henrywalser.com"
 SKIP_EXT = (".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".pdf", ".css",
             ".js", ".ico", ".zip", ".mp4", ".mp3", ".woff", ".woff2", ".ttf",
             ".xml", ".gz")
-SKIP_PATH_PREFIXES = ("/obituaries", "/Administration", "/administration",
+SKIP_PATH_PREFIXES = ("/Administration", "/administration",
                       "/admin", "/login", "/signin", "/sign-in")
+# Pages under /obituaries that are NOT obituaries (the listing / search page and
+# its information pages) are scraped. Individual obituaries are not: those are
+# handled by the obituary scraper.
+OBITUARY_PAGE_SEEDS = ("/obituaries/obituary-listings",)
 VIDEO_HOST_HINTS = ("youtube.com", "youtu.be", "youtube-nocookie.com", "vimeo.com",
                     "player.vimeo.com", "wistia", "tukios", "brightcove")
 CHALLENGE_HINTS = ("just a moment", "attention required", "checking your browser",
@@ -77,6 +82,20 @@ def section_of(url):
     return parts[0] if parts else "home"
 
 
+def is_individual_obituary(url):
+    """True for one person's obituary: /obituaries/Name?obId=123, or a
+    capitalised person-name slug such as /obituaries/Martin-John-Ostertag.
+    False for the listing / search page and the other information pages
+    (/obituaries/obituary-listings, /obituaries/showing-support, ...)."""
+    parts = urlparse(url)
+    if not parts.path.lower().startswith("/obituaries"):
+        return False
+    if "obid=" in (parts.query or "").lower():
+        return True
+    slug = parts.path.rstrip("/").split("/")[-1]
+    return parts.path.rstrip("/").lower() != "/obituaries" and any(ch.isupper() for ch in slug)
+
+
 def is_skippable_path(path):
     if any(path.startswith(p) for p in SKIP_PATH_PREFIXES):
         return True
@@ -91,6 +110,26 @@ def is_skippable_path(path):
             else:
                 break
     return False
+
+
+def remove_obituary_cards(soup, page_url):
+    """On the obituary listing / search page, remove each listed obituary (its
+    card: name, dates, photo, link) so only the page's own words are kept.
+    A card is the largest element around one obituary link that holds no other
+    obituary link, so the page's surrounding text is never removed."""
+    links = [a for a in soup.find_all("a", href=True)
+             if is_individual_obituary(urljoin(page_url, a["href"]))]
+    for a in links:
+        if a.parent is None:
+            continue                      # already removed with an earlier card
+        node = a
+        while node.parent is not None and node.parent.name not in ("body", "html", "main", "[document]"):
+            inside = [x for x in node.parent.find_all("a", href=True)
+                      if is_individual_obituary(urljoin(page_url, x["href"]))]
+            if len(inside) > 1:
+                break
+            node = node.parent
+        node.decompose()
 
 
 def extract_main_text(soup):
@@ -142,7 +181,7 @@ def extract_links(soup, page_url):
         if same_host(full):
             path = page_key(full)
             low = path.lower()
-            if low.endswith(SKIP_EXT) or is_skippable_path(path):
+            if low.endswith(SKIP_EXT) or is_skippable_path(path) or is_individual_obituary(full):
                 return
             internal.add(full.split("#")[0])
         else:
@@ -173,6 +212,8 @@ def parse_page(html_content, page_url):
     soup = BeautifulSoup(html_content, "html.parser")
     meta = extract_metadata(soup)
     internal, external, videos = extract_links(soup, page_url)
+    if urlparse(page_url).path.lower().startswith("/obituaries"):
+        remove_obituary_cards(soup, page_url)
     text = extract_main_text(soup)
     title = meta["title"] or meta["h1"] or page_key(page_url)
     return {
@@ -197,7 +238,10 @@ def get_urls_from_sitemap(sitemap_url, session):
         logging.error(f"Failed to fetch sitemap {sitemap_url}: {e}")
         return []
 
-    soup = BeautifulSoup(resp.content, "xml")
+    content = resp.content
+    if content[:2] == b"\x1f\x8b":          # .xml.gz sitemaps arrive compressed
+        content = gzip.decompress(content)
+    soup = BeautifulSoup(content, "xml")
     sub_sitemaps = [loc.text.strip() for loc in soup.find_all("loc")
                     if "sitemap" in loc.text.lower()]
     if sub_sitemaps and soup.find("sitemapindex"):
@@ -205,9 +249,9 @@ def get_urls_from_sitemap(sitemap_url, session):
         all_urls = []
         for idx, sub_url in enumerate(sub_sitemaps, start=1):
             if "obituar" in sub_url.lower():
-                logging.info(f"   [{idx}/{len(sub_sitemaps)}] Skipping obituary sitemap: {sub_url}")
-                continue
-            logging.info(f"   [{idx}/{len(sub_sitemaps)}] Reading: {sub_url}")
+                logging.info(f"   [{idx}/{len(sub_sitemaps)}] Reading obituary sitemap for its non-obituary pages only: {sub_url}")
+            else:
+                logging.info(f"   [{idx}/{len(sub_sitemaps)}] Reading: {sub_url}")
             all_urls.extend(get_urls_from_sitemap(sub_url, session))
         return list(set(all_urls))
 
@@ -217,7 +261,7 @@ def get_urls_from_sitemap(sitemap_url, session):
         if not same_host(u):
             continue
         path = page_key(u)
-        if path.lower().endswith(SKIP_EXT) or is_skippable_path(path):
+        if path.lower().endswith(SKIP_EXT) or is_skippable_path(path) or is_individual_obituary(u):
             continue
         urls.append(u.split("#")[0])
     return list(set(urls))
@@ -340,6 +384,8 @@ def main():
     session = cffi_requests.Session()
     seed_urls = get_urls_from_sitemap(args.sitemap, session)
     seed_urls.append(args.base_url)
+    for p in OBITUARY_PAGE_SEEDS:            # in case the sitemap can't be read
+        seed_urls.append(args.base_url.rstrip("/") + p)
     seen, frontier = set(), deque()
     for u in seed_urls:
         k = page_key(u)
