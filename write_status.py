@@ -23,7 +23,7 @@ import gspread
 from gspread.exceptions import APIError, WorksheetNotFound
 
 HEADER = ["Job", "Last run (Kitchener time)", "Result", "Rows in tab", "Run details"]
-PREFERRED_TAB = "Sheet1"
+PREFERRED_TAB = "Timestamps"
 FALLBACK_TAB = "Sync Status"
 
 
