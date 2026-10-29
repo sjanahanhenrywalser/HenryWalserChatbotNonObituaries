@@ -3,7 +3,7 @@ name: Daily Page Sync
 on:
   schedule:
     # Runs automatically every day at 03:00 UTC (offset from the obituary job's 02:00)
-    - cron: '0 3 * * *'
+    - cron: '0 6,18 * * *'
   workflow_dispatch: # Allows manual trigger anytime from the GitHub Actions UI
 
 permissions:
